@@ -1,6 +1,0 @@
-<Solution>
-  <Folder Name="/Compose/">
-    <File Path="KillSwitchTraceIdLeak/docker-compose.yml" />
-  </Folder>
-  <Project Path="KillSwitchTraceIdLeak/KillSwitchTraceIdLeak.csproj" />
-</Solution>

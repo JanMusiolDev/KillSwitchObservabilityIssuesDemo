@@ -1,13 +1,17 @@
 using Confluent.Kafka;
 using Confluent.Kafka.Admin;
-using KillSwitchTraceIdLeak;
-using MassTransit;
+using JasperFx.Core;
+using CircuitBreakerTraceIdLeak;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Serilog;
 using Serilog.Core;
-using Serilog.Sinks.OpenTelemetry;
 using SerilogTracing;
+using Wolverine;
+using Wolverine.Configuration;
+using Wolverine.ErrorHandling;
+using Wolverine.Kafka;
+using Serilog.Sinks.OpenTelemetry;
 
 Log.Logger = CreateLogger();
 
@@ -15,62 +19,15 @@ using var _ = new ActivityListenerConfiguration()
     .Instrument.AspNetCoreRequests()
     .TraceToSharedLogger();
 
-#region workaround
-//comment/uncomment following code block to see the difference in Seq's UI/console.
-//With the workaround in place, the kill switch will still trip and restart the consumer as expected,
-//but the TraceId leak will be prevented and you'll see clean TraceIds for all messages in Seq.
-//not sure of all sideeffects of this workaround
-
-//using var leakWorkaround = new ActivityListener
-//{
-//    ShouldListenTo = source => source.Name is "MassTransit",
-//    Sample = (ref ActivityCreationOptions<ActivityContext> options) =>
-//    {
-//        if (Activity.Current is { Duration.Ticks: > 0 })
-//            Activity.Current = null;
-//        return ActivitySamplingResult.PropagationData;
-//    }
-//};
-//ActivitySource.AddActivityListener(leakWorkaround);
-#endregion
-
 await ConfigureKafkaTopic();
 
 var host = Host.CreateDefaultBuilder(args)
     .UseSerilog()
+    .UseWolverine()
     .ConfigureServices((_, services) =>
     {
-        services.AddMassTransit(x =>
-        {
-            x.UsingInMemory((ctx, cfg) => cfg.ConfigureEndpoints(ctx));
-
-            x.AddRider(rider =>
-            {
-                rider.AddConsumer<DemoConsumer>();
-
-                rider.UsingKafka((ctx, kafka) =>
-                {
-                    kafka.Host(DemoConfig.BootstrapServers);
-
-                    kafka.TopicEndpoint<DemoMessage>(
-                        DemoConfig.TopicName,
-                        DemoConfig.ConsumerGroupId,
-                        ep =>
-                        {
-                            ep.AutoOffsetReset = AutoOffsetReset.Latest;
-                            ep.UseKillSwitch(opts =>
-                            {
-                                opts.SetActivationThreshold(DemoConfig.KsActivationThreshold);
-                                opts.SetTripThreshold(DemoConfig.KsTripThreshold);
-                                opts.SetRestartTimeout(s: DemoConfig.KsRestartSeconds);
-                                opts.SetTrackingPeriod(TimeSpan.FromSeconds(30));
-                            });
-
-                            ep.ConfigureConsumer<DemoConsumer>(ctx);
-                        });
-                });
-            });
-        });
+        services.AddSingleton<ConsumptionTracker>();
+        services.AddWolverineExtension<KafkaWolverineExtension>();
 
         services.AddHostedService<PublisherService>();
     })
@@ -96,7 +53,7 @@ static Logger CreateLogger()
         opts.Protocol = OtlpProtocol.HttpProtobuf;
         opts.ResourceAttributes = new Dictionary<string, object>
         {
-            ["service.name"] = "KillSwitchTraceIdLeak"
+            ["service.name"] = "CircuitBreakerTraceIdLeak"
             //other properties
         };
     })
@@ -109,6 +66,21 @@ static async Task ConfigureKafkaTopic()
 {
     using (var admin = new AdminClientBuilder(new AdminClientConfig { BootstrapServers = DemoConfig.BootstrapServers }).Build())
     {
+        try
+        {
+            //check if topic exixts, if it does - empty it, if not - create it
+            var desc = await admin.DescribeTopicsAsync(TopicCollection.OfTopicNames([DemoConfig.TopicName]));
+            if (desc.TopicDescriptions.Count > 0)
+            {
+                await admin.DeleteTopicsAsync([DemoConfig.TopicName]);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "could not delete Kafka topic - might not exist");
+
+        }
+
         try
         {
             await admin.CreateTopicsAsync(
@@ -128,4 +100,41 @@ static async Task ConfigureKafkaTopic()
             Log.Information("Kafka topic '{Topic}' already exists", DemoConfig.TopicName);
         }
     }
+}
+
+public class KafkaWolverineExtension() : IWolverineExtension
+{
+    public void Configure(WolverineOptions opts)
+    {
+        opts.UseKafka(DemoConfig.BootstrapServers)
+        .ConfigureClient((cfg) => { })
+        .ConsumeOnly();
+
+        opts.ListenToKafkaTopic(DemoConfig.TopicName)
+            .ProcessInline()
+            .ReceiveRawJson<DemoMessage>()
+            .ConfigureConsumer(consumer =>
+            {
+                consumer.GroupId = DemoConfig.ConsumerGroupId;
+                consumer.AutoOffsetReset = AutoOffsetReset.Earliest;
+            });
+
+        // Configure circuit breaker and custom serializer on Kafka endpoint
+        opts.Policies.Add(new LambdaEndpointPolicy<KafkaTopic>((endpoint, runtime) =>
+        {
+            //endpoint.DefaultSerializer = runtime.Services.GetRequiredService<LoggingJsonSerializer>();
+
+            endpoint.CircuitBreakerOptions = new CircuitBreakerOptions
+            {
+                TrackingPeriod = 30.Seconds(),
+                MinimumThreshold = DemoConfig.CbActivationThreshold,
+                FailurePercentageThreshold = DemoConfig.CbTripThreshold,
+                PauseTime = DemoConfig.CbRestartSeconds.Seconds(),
+                SamplingPeriod = 100.Milliseconds()
+            };
+        }));
+
+        opts.Policies.DisableConventionalLocalRouting();
+    }
+
 }

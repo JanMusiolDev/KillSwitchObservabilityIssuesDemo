@@ -8,12 +8,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="MassTransit" Version="8.5.5" />
-    <PackageReference Include="MassTransit.Kafka" Version="8.5.5" />
     <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.15.0" />
     <PackageReference Include="Serilog.AspNetCore" Version="9.0.0" />
     <PackageReference Include="Serilog.Sinks.OpenTelemetry" Version="4.2.0" />
     <PackageReference Include="SerilogTracing.Instrumentation.AspNetCore" Version="2.3.1" />
+    <PackageReference Include="WolverineFx.Kafka" Version="5.29.0" />
   </ItemGroup>
 
 </Project>
